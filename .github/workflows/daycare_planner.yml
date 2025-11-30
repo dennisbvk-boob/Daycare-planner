@@ -6,9 +6,9 @@ name: Daycare Planner
 # See the README for details on configuring secrets.
 
 on:
-  schedule:
+  #schedule:
     # Every hour on the hour
-    - cron: '0 * * * *'
+    #- cron: '0 * * * *'
 
   # Allow manual runs from the GitHub Actions UI
   workflow_dispatch:
