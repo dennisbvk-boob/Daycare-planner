@@ -2,44 +2,40 @@
 Daycare Planner Script
 ======================
 
-This script reads a Google Sheet with columns ``Week nummer``, ``Datum``,
-``Oppas`` and ``Comments`` and creates all‑day Google Calendar events
-for each row.  Each event is titled ``Oppas – <oppas naam>``, has
-the corresponding date as the event date and uses the ``Comments`` field
-as the description.
+This script reads babysitting appointments from a Google Sheet (with columns
+``Week nummer``, ``Datum``, ``Oppas`` and ``Comments``) and emails
+iCalendar invites to the babysitters and yourself.  Each invite is
+an all‑day event titled ``Oppas – <oppas naam>`` on the specified
+date and includes the comment as the description.
 
 The script is intended to run periodically (for example via a GitHub
-Actions workflow) and uses a Google service account to authenticate
-against both the Sheets and Calendar APIs.  It also supports sending
-invitations to the babysitter (the person in the ``Oppas`` column) and
-to a default user email address.
+Actions workflow) and it does **not** require a Google developer
+account.  Instead of using Google APIs, it fetches the sheet as a
+CSV via a direct download link and sends invites via SMTP.
 
 Environment variables
 ---------------------
 
 The following environment variables must be set for the script to run:
 
-``GOOGLE_SERVICE_ACCOUNT``
-    The JSON credentials for a Google service account with
-    ``sheets.readonly`` and ``calendar`` scopes.  The JSON document
-    should be provided as a single line string.  See the accompanying
-    README.md for instructions on how to create this.
+``CSV_URL``
+    The direct download link to the sheet in CSV format.  You can
+    construct this by taking the sheet URL and replacing everything
+    after the spreadsheet ID with ``/export?format=csv`` and, if
+    necessary, appending ``&gid=...`` for a specific tab.  See
+    the README for details and examples.
 
-``GOOGLE_SHEET_ID``
-    The ID of the Google Sheet containing the babysitting schedule.
-    You can find this in the URL of the spreadsheet (the long string
-    between ``/d/`` and ``/edit``).
+``SMTP_USERNAME``
+    The email address used to send the invites (e.g. your Gmail address).
 
-``GOOGLE_CALENDAR_ID``
-    The ID of the Google Calendar into which events should be added.
-    For personal calendars this is usually your Gmail address.  For
-    shared calendars you can find the ID under the calendar settings in
-    Google Calendar.
+``SMTP_PASSWORD``
+    The SMTP password or app password for the above account.  When using
+    Gmail, you must enable 2‑factor authentication and create an
+    app password.
 
 ``USER_EMAIL``
     (Optional) Your own email address.  If provided, you will be
-    included as an attendee on all created events so that you receive
-    invitations.
+    included as an attendee on all invites so that you receive them.
 
 ``EMAIL_MAP``
     (Optional) A JSON object mapping values from the ``Oppas`` column
@@ -51,20 +47,24 @@ The following environment variables must be set for the script to run:
         }
 
     If a babysitter name is present in this mapping, the script will
-    include that email address as an attendee on the event.  Any rows
-    without a corresponding email in this mapping will still result in
-    an event being created, but no invitation will be sent to the
-    babysitter.
+    include that email address as an attendee on the invitation.  Any
+    rows without a corresponding email in this mapping will still
+    result in an invitation being created, but no email will be sent
+    to the babysitter.
+
+``SMTP_HOST`` and ``SMTP_PORT``
+    (Optional) Override the default SMTP server (``smtp.gmail.com``)
+    and port (``587``) if using a different provider.
 
 Dependencies
 ------------
 
-This script requires ``gspread``, ``google-api-python-client``,
-``google-auth``, and ``python-dateutil``.  These will be installed in
-the accompanying GitHub Actions workflow, but if you run the script
-locally you can install them via::
+This script requires ``requests``, ``python-dateutil`` and the
+standard library.  These will be installed in the accompanying
+GitHub Actions workflow, but if you run the script locally you can
+install them via::
 
-    pip install gspread google-api-python-client google-auth python-dateutil
+    pip install requests python-dateutil
 
 """
 
@@ -73,70 +73,59 @@ import os
 import datetime
 from typing import Dict, Any, List
 
-import gspread
 from dateutil import parser as date_parser
-from google.oauth2.service_account import Credentials
-from googleapiclient.discovery import build
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import uuid
+import requests
+import csv
 
 
-def load_service_account() -> Credentials:
-    """Load Google service account credentials from the environment.
-
-    Returns
-    -------
-    Credentials
-        An authenticated credentials object with the required scopes.
-    """
-    credentials_json = os.environ.get("GOOGLE_SERVICE_ACCOUNT")
-    if not credentials_json:
-        raise EnvironmentError("GOOGLE_SERVICE_ACCOUNT environment variable is not set")
-    try:
-        info = json.loads(credentials_json)
-    except json.JSONDecodeError as exc:
-        raise ValueError("GOOGLE_SERVICE_ACCOUNT does not contain valid JSON") from exc
-
-    scopes = [
-        'https://www.googleapis.com/auth/spreadsheets.readonly',
-        'https://www.googleapis.com/auth/calendar'
-    ]
-    return Credentials.from_service_account_info(info, scopes=scopes)
-
-
-def get_sheet_records(sheet_id: str, creds: Credentials) -> List[Dict[str, Any]]:
-    """Retrieve all rows from the first worksheet of a Google Sheet.
+def fetch_csv_records(csv_url: str) -> List[Dict[str, Any]]:
+    """Download and parse CSV data from a Google Sheet.
 
     Parameters
     ----------
-    sheet_id : str
-        The Google Sheet ID.
-    creds : Credentials
-        Authenticated Google credentials.
+    csv_url : str
+        The direct CSV export URL of the Google Sheet.
 
     Returns
     -------
     List[Dict[str, Any]]
-        A list of dictionaries keyed by column header.
+        A list of dictionaries keyed by the CSV header row.
     """
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key(sheet_id)
-    worksheet = sheet.sheet1
-    return worksheet.get_all_records()
+    response = requests.get(csv_url)
+    response.raise_for_status()
+    # Decode the response content as UTF-8; Google CSVs are typically UTF-8.
+    content = response.content.decode('utf-8')
+    reader = csv.DictReader(content.splitlines())
+    return [row for row in reader]
 
 
-def build_calendar_service(creds: Credentials):
-    """Create a Google Calendar API client.
+def build_smtp_client(host: str, port: int, username: str, password: str) -> smtplib.SMTP:
+    """Authenticate and return an SMTP client for sending emails.
 
     Parameters
     ----------
-    creds : Credentials
-        Authenticated Google credentials.
+    host : str
+        SMTP server host (e.g. ``smtp.gmail.com``).
+    port : int
+        SMTP server port (e.g. 587 for TLS).
+    username : str
+        SMTP login username.
+    password : str
+        SMTP login password (for Gmail this should be an app password).
 
     Returns
     -------
-    googleapiclient.discovery.Resource
-        A Calendar API service resource.
+    smtplib.SMTP
+        An authenticated SMTP client.
     """
-    return build('calendar', 'v3', credentials=creds, cache_discovery=False)
+    client = smtplib.SMTP(host, port)
+    client.starttls()
+    client.login(username, password)
+    return client
 
 
 def parse_date(date_str: str) -> datetime.date:
@@ -163,87 +152,147 @@ def parse_date(date_str: str) -> datetime.date:
     return dt.date()
 
 
-def create_event_body(row: Dict[str, Any], email_map: Dict[str, str], user_email: str) -> Dict[str, Any]:
-    """Construct a Google Calendar event body from a sheet row.
+def build_ics_event(
+    date_str: str,
+    oppas_name: str,
+    description: str,
+    organizer_email: str,
+    babysitter_email: str,
+    user_email: str,
+) -> str:
+    """Create an iCalendar event string for emailing invitations.
 
     Parameters
     ----------
-    row : dict
-        The row from the spreadsheet, keyed by column headers.
-    email_map : dict
-        Mapping of babysitter names (Oppas) to their email addresses.
+    date_str : str
+        Date string from the sheet (parsed by ``parse_date``).
+    oppas_name : str
+        Name of the babysitter.
+    description : str
+        Event description from the sheet.
+    organizer_email : str
+        Email address used as the organiser (the SMTP login address).
+    babysitter_email : str
+        Email address of the babysitter (may be ``None``).
     user_email : str
-        The default email to include on all events (may be ``None``).
+        Email address of the user to include as attendee (may be ``None``).
 
     Returns
     -------
-    dict
-        The event definition to pass to the Calendar API.
+    str
+        An RFC5545 iCalendar meeting invitation.
     """
-    date_str = row.get('Datum')
-    oppas_name = row.get('Oppas')
-    comments = row.get('Comments', '')
-
-    if not date_str or not oppas_name:
-        raise ValueError("Row must contain both 'Datum' and 'Oppas' fields")
-
     event_date = parse_date(date_str)
-    start_date_iso = event_date.isoformat()
-    end_date_iso = (event_date + datetime.timedelta(days=1)).isoformat()
-
-    attendees = []
-    babysitter_email = email_map.get(oppas_name)
+    start_date = event_date
+    # End date is exclusive for all‑day events; for a one‑day event we add one day.
+    end_date = event_date + datetime.timedelta(days=1)
+    dtstamp = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+    uid = f"{uuid.uuid4()}@daycare-planner"
+    lines = [
+        'BEGIN:VCALENDAR',
+        'PRODID:-//Daycare Planner//EN',
+        'VERSION:2.0',
+        'CALSCALE:GREGORIAN',
+        'METHOD:REQUEST',
+        'BEGIN:VEVENT',
+        f'UID:{uid}',
+        f'DTSTAMP:{dtstamp}',
+        f'DTSTART;VALUE=DATE:{start_date.strftime("%Y%m%d")}',
+        f'DTEND;VALUE=DATE:{end_date.strftime("%Y%m%d")}',
+        f'SUMMARY:Oppas – {oppas_name}',
+        f'DESCRIPTION:{description}',
+        f'ORGANIZER:MAILTO:{organizer_email}',
+    ]
+    # Add attendees
     if babysitter_email:
-        attendees.append({'email': babysitter_email})
+        lines.append(f'ATTENDEE;CN={oppas_name};RSVP=TRUE:MAILTO:{babysitter_email}')
     if user_email:
-        attendees.append({'email': user_email})
-
-    return {
-        'summary': f'Oppas – {oppas_name}',
-        'description': comments,
-        'start': {'date': start_date_iso, 'timeZone': 'Europe/Amsterdam'},
-        'end': {'date': end_date_iso, 'timeZone': 'Europe/Amsterdam'},
-        'attendees': attendees,
-    }
+        # Avoid duplicate addresses
+        if user_email != babysitter_email:
+            lines.append(f'ATTENDEE;CN=Planner User;RSVP=TRUE:MAILTO:{user_email}')
+    lines.extend([
+        'END:VEVENT',
+        'END:VCALENDAR',
+    ])
+    return '\r\n'.join(lines)
 
 
 def main() -> None:
     """Main routine for the daycare planner.
 
-    Loads credentials, reads the sheet, constructs events and inserts
-    them into the target calendar.  Currently this script always
-    creates events; it does not check for or update existing events.
+    Loads credentials, reads the sheet, constructs .ics invitations and
+    emails them via SMTP.  This version does not use the Google
+    Calendar API; instead, recipients will receive iCalendar invites
+    via email, which Gmail will interpret as calendar events.
     """
-    sheet_id = os.environ.get('GOOGLE_SHEET_ID')
-    calendar_id = os.environ.get('GOOGLE_CALENDAR_ID')
-    if not sheet_id or not calendar_id:
-        raise EnvironmentError('GOOGLE_SHEET_ID and GOOGLE_CALENDAR_ID must be set')
+    csv_url = os.environ.get('CSV_URL')
+    if not csv_url:
+        raise EnvironmentError('CSV_URL must be set')
 
     user_email = os.environ.get('USER_EMAIL')
     email_map_str = os.environ.get('EMAIL_MAP', '{}')
     try:
-        email_map = json.loads(email_map_str)
+        email_map: Dict[str, str] = json.loads(email_map_str)
     except json.JSONDecodeError:
         raise ValueError('EMAIL_MAP environment variable must be valid JSON')
 
-    creds = load_service_account()
-    records = get_sheet_records(sheet_id, creds)
-    calendar_service = build_calendar_service(creds)
+    # SMTP configuration
+    smtp_host = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
+    smtp_port = int(os.environ.get('SMTP_PORT', '587'))
+    smtp_username = os.environ.get('SMTP_USERNAME')
+    smtp_password = os.environ.get('SMTP_PASSWORD')
+    if not smtp_username or not smtp_password:
+        raise EnvironmentError('SMTP_USERNAME and SMTP_PASSWORD must be set')
+
+    # Fetch the CSV data
+    records = fetch_csv_records(csv_url)
+
+    smtp_client = build_smtp_client(smtp_host, smtp_port, smtp_username, smtp_password)
 
     for row in records:
-        try:
-            event_body = create_event_body(row, email_map, user_email)
-        except ValueError as exc:
-            print(f'Skipping row due to error: {exc}')
+        date_str = row.get('Datum')
+        oppas_name = row.get('Oppas')
+        description = row.get('Comments', '')
+        if not date_str or not oppas_name:
+            print('Skipping row missing required fields')
             continue
 
-        # Insert the event.  sendUpdates='all' ensures invites are sent.
-        calendar_service.events().insert(
-            calendarId=calendar_id,
-            body=event_body,
-            sendUpdates='all'
-        ).execute()
-        print(f"Created event: {event_body['summary']} on {event_body['start']['date']}")
+        babysitter_email = email_map.get(oppas_name)
+        # Build the iCalendar event
+        ics_content = build_ics_event(
+            date_str=date_str,
+            oppas_name=oppas_name,
+            description=description,
+            organizer_email=smtp_username,
+            babysitter_email=babysitter_email,
+            user_email=user_email,
+        )
+        # Prepare the email
+        recipients = []
+        if babysitter_email:
+            recipients.append(babysitter_email)
+        if user_email and user_email not in recipients:
+            recipients.append(user_email)
+        if not recipients:
+            # If no recipients, skip sending
+            print(f'No recipients for {oppas_name}; skipping')
+            continue
+        msg = MIMEMultipart('mixed')
+        msg['Subject'] = f'Oppas – {oppas_name} ({date_str})'
+        msg['From'] = smtp_username
+        msg['To'] = ', '.join(recipients)
+        # Simple text body for clients that cannot handle calendar invites
+        msg.attach(MIMEText('Zie de bijgevoegde kalenderuitnodiging.', 'plain', 'utf-8'))
+        part = MIMEText(ics_content, 'calendar;method=REQUEST', 'utf-8')
+        msg.attach(part)
+        # Send the email
+        try:
+            smtp_client.sendmail(smtp_username, recipients, msg.as_string())
+            print(f'Sent invite for {oppas_name} on {date_str} to {recipients}')
+        except Exception as exc:
+            print(f'Failed to send invite for {oppas_name} on {date_str}: {exc}')
+
+    smtp_client.quit()
 
 
 if __name__ == '__main__':

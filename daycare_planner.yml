@@ -1,9 +1,9 @@
 name: Daycare Planner
 
-# This workflow runs hourly to synchronise babysitting entries from
-# a Google Sheet into a Google Calendar.  It relies on secrets set in
-# the repository's settings (see README for details) and requires
-# python dependencies to be installed.
+# This workflow runs hourly to transform babysitting entries from a
+# Google Sheet into iCalendar invitations sent via email.  The script
+# fetches the sheet as a CSV file and sends .ics invites using SMTP.
+# See the README for details on configuring secrets.
 
 on:
   schedule:
@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  sync-calendar:
+  send-invites:
     runs-on: ubuntu-latest
 
     steps:
@@ -27,15 +27,24 @@ jobs:
           python-version: '3.10'
 
       - name: Install dependencies
+        # Install only the required Python packages: requests and python-dateutil.
+        # We no longer use gspread or google-auth because the script reads
+        # the sheet via a CSV export URL instead of the Google API.
         run: |
-          pip install --no-cache-dir gspread google-api-python-client google-auth python-dateutil
+          pip install --no-cache-dir requests python-dateutil
 
       - name: Run planner script
+        # Pass environment variables from repository secrets.  The CSV_URL
+        # should be a direct CSV export link to the sheet.  SMTP_USERNAME
+        # and SMTP_PASSWORD are required for sending mail.  USER_EMAIL
+        # and EMAIL_MAP are optional.  See README for details.
         env:
-          GOOGLE_SERVICE_ACCOUNT: ${{ secrets.GOOGLE_SERVICE_ACCOUNT }}
-          GOOGLE_SHEET_ID: ${{ secrets.GOOGLE_SHEET_ID }}
-          GOOGLE_CALENDAR_ID: ${{ secrets.GOOGLE_CALENDAR_ID }}
+          CSV_URL: ${{ secrets.CSV_URL }}
           USER_EMAIL: ${{ secrets.USER_EMAIL }}
           EMAIL_MAP: ${{ secrets.EMAIL_MAP }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
         run: |
           python daycare_planner.py
