@@ -75,8 +75,8 @@ from typing import Dict, Any, List
 
 from dateutil import parser as date_parser
 import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
 import uuid
 import requests
 import csv
@@ -298,9 +298,6 @@ def main() -> None:
             babysitter_emails=babysitter_emails,
             user_email=user_email,
         )
-
-from email.mime.base import MIMEBase
-from email import encoders
 
 ical = MIMEBase('text', 'calendar', method="REQUEST", charset="UTF-8")
 ical.set_payload(ics_content)
