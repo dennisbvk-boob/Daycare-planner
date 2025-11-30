@@ -157,7 +157,7 @@ def build_ics_event(
     oppas_name: str,
     description: str,
     organizer_email: str,
-    babysitter_email: str,
+    babysitter_emails: List[str],
     user_email: str,
 ) -> str:
     """Create an iCalendar event string for emailing invitations.
@@ -172,8 +172,8 @@ def build_ics_event(
         Event description from the sheet.
     organizer_email : str
         Email address used as the organiser (the SMTP login address).
-    babysitter_email : str
-        Email address of the babysitter (may be ``None``).
+    babysitter_emails : List[str]
+        One or more email addresses of the babysitter(s).
     user_email : str
         Email address of the user to include as attendee (may be ``None``).
 
@@ -184,10 +184,11 @@ def build_ics_event(
     """
     event_date = parse_date(date_str)
     start_date = event_date
-    # End date is exclusive for all‑day events; for a one‑day event we add one day.
-    end_date = event_date + datetime.timedelta(days=1)
+    end_date = event_date + datetime.timedelta(days=1)  # all-day event
+
     dtstamp = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
     uid = f"{uuid.uuid4()}@daycare-planner"
+
     lines = [
         'BEGIN:VCALENDAR',
         'PRODID:-//Daycare Planner//EN',
@@ -203,13 +204,19 @@ def build_ics_event(
         f'DESCRIPTION:{description}',
         f'ORGANIZER:MAILTO:{organizer_email}',
     ]
-    # Add attendees
-    if babysitter_email:
-        lines.append(f'ATTENDEE;CN={oppas_name};RSVP=TRUE:MAILTO:{babysitter_email}')
-    if user_email:
-        # Avoid duplicate addresses
-        if user_email != babysitter_email:
-            lines.append(f'ATTENDEE;CN=Planner User;RSVP=TRUE:MAILTO:{user_email}')
+
+    # Babysitter(s) als attendees
+    for email in babysitter_emails or []:
+        lines.append(
+            f'ATTENDEE;CN={oppas_name};RSVP=TRUE:MAILTO:{email}'
+        )
+
+    # Jijzelf als attendee (als gezet en niet al in de lijst)
+    if user_email and user_email not in (babysitter_emails or []):
+        lines.append(
+            f'ATTENDEE;CN=Planner User;RSVP=TRUE:MAILTO:{user_email}'
+        )
+
     lines.extend([
         'END:VEVENT',
         'END:VCALENDAR',
@@ -250,45 +257,65 @@ def main() -> None:
     smtp_client = build_smtp_client(smtp_host, smtp_port, smtp_username, smtp_password)
 
     for row in records:
-        date_str = row.get('Datum')
-        oppas_name = row.get('Oppas')
-        description = row.get('Comments', '')
+        date_str = (row.get('Datum') or '').strip()
+        oppas_name = (row.get('Oppas') or '').strip()
+        description = row.get('Comments', '') or ''
+
+        # Skip rows zonder datum of oppas
         if not date_str or not oppas_name:
             print('Skipping row missing required fields')
             continue
 
-        babysitter_email = email_map.get(oppas_name)
+        # Skip speciale waarden die geen invites mogen triggeren
+        if oppas_name in ('Nvt', 'Nog te plannen'):
+            print(f"Skipping row for oppas '{oppas_name}' (no invite needed)")
+            continue
+
+        # Bepaal e-mail(s) voor deze oppas uit EMAIL_MAP
+        mapped = email_map.get(oppas_name)
+        if isinstance(mapped, list):
+            babysitter_emails = mapped
+        elif isinstance(mapped, str):
+            babysitter_emails = [mapped]
+        else:
+            babysitter_emails = []
+
+        # Als er echt niemand is om naar te mailen en jijzelf is ook None → skippen
+        recipients = set(babysitter_emails)
+        if user_email:
+            recipients.add(user_email)
+
+        if not recipients:
+            print(f'No recipients for {oppas_name}; skipping')
+            continue
+
         # Build the iCalendar event
         ics_content = build_ics_event(
             date_str=date_str,
             oppas_name=oppas_name,
             description=description,
             organizer_email=smtp_username,
-            babysitter_email=babysitter_email,
+            babysitter_emails=babysitter_emails,
             user_email=user_email,
         )
+
         # Prepare the email
-        recipients = []
-        if babysitter_email:
-            recipients.append(babysitter_email)
-        if user_email and user_email not in recipients:
-            recipients.append(user_email)
-        if not recipients:
-            # If no recipients, skip sending
-            print(f'No recipients for {oppas_name}; skipping')
-            continue
+        recipients_list = list(recipients)
         msg = MIMEMultipart('mixed')
         msg['Subject'] = f'Oppas – {oppas_name} ({date_str})'
         msg['From'] = smtp_username
-        msg['To'] = ', '.join(recipients)
+        msg['To'] = ', '.join(recipients_list)
+
         # Simple text body for clients that cannot handle calendar invites
         msg.attach(MIMEText('Zie de bijgevoegde kalenderuitnodiging.', 'plain', 'utf-8'))
+
         part = MIMEText(ics_content, 'calendar;method=REQUEST', 'utf-8')
         msg.attach(part)
+
         # Send the email
         try:
-            smtp_client.sendmail(smtp_username, recipients, msg.as_string())
-            print(f'Sent invite for {oppas_name} on {date_str} to {recipients}')
+            smtp_client.sendmail(smtp_username, recipients_list, msg.as_string())
+            print(f'Sent invite for {oppas_name} on {date_str} to {recipients_list}')
         except Exception as exc:
             print(f'Failed to send invite for {oppas_name} on {date_str}: {exc}')
 
