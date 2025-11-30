@@ -299,18 +299,16 @@ def main() -> None:
             user_email=user_email,
         )
 
-        # Prepare the email
-        recipients_list = list(recipients)
-        msg = MIMEMultipart('mixed')
-        msg['Subject'] = f'Oppas – {oppas_name} ({date_str})'
-        msg['From'] = smtp_username
-        msg['To'] = ', '.join(recipients_list)
+from email.mime.base import MIMEBase
+from email import encoders
 
-        # Simple text body for clients that cannot handle calendar invites
-        msg.attach(MIMEText('Zie de bijgevoegde kalenderuitnodiging.', 'plain', 'utf-8'))
+ical = MIMEBase('text', 'calendar', method="REQUEST", charset="UTF-8")
+ical.set_payload(ics_content)
+encoders.encode_base64(ical)
+ical.add_header('Content-Disposition', 'attachment; filename="invite.ics"')
+ical.add_header('Content-Class', 'urn:content-classes:calendarmessage')
 
-        part = MIMEText(ics_content, 'calendar;method=REQUEST', 'utf-8')
-        msg.attach(part)
+msg.attach(ical)
 
         # Send the email
         try:
